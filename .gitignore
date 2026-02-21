@@ -37,3 +37,7 @@ tree-sitter-c/
 codebase/
 
 output/
+
+chroma_db
+
+test.py
