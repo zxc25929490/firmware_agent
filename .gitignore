@@ -1,0 +1,39 @@
+# virtualenv
+.venv/
+venv/
+env/
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# build
+build/
+dist/
+*.egg-info/
+
+# logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# dotenv
+.env
+
+# node (如果你有用前端)
+node_modules/
+
+# tree-sitter / third-party source
+tree-sitter-c/
+
+codebase/
+
+output/
