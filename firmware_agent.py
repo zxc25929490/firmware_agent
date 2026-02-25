@@ -1,298 +1,700 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Firmware Analysis Engine v3
-Modes:
-  - Explain Mode: function semantic (reads real C code from Chroma)
-  - Control Flow Mode: decision graph reasoning (structured JSON)
-  - Sink Trace Mode: who calls sink (callers)
-  - Data Flow Mode: mask/flag/bit/assign analysis (reads real C code + optional grep callers)
-"""
-
 import argparse
 import json
+import os
 import re
+from collections import Counter, defaultdict
 from pathlib import Path
-import requests
+from typing import Any, Dict, List, Optional, Tuple
+
 import chromadb
+import requests
+
+from query_call import FirmwareQueryEngine
+
 
 # =========================
 # Config
 # =========================
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
+MODEL = os.environ.get("FIRMWARE_MODEL", "qwen2.5:14b-instruct")
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "llama3"
+CHROMA_PATH = os.environ.get("CHROMA_PATH", "./chroma_db")
+CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "codebase")
 
-CHROMA_PATH = "./chroma_db"
-COLLECTION = "codebase"
+CALL_GRAPH_JSON = os.environ.get("CALL_GRAPH_JSON", "output/functions.json")
 
-# Your existing structured decision graph (LED cases etc.)
-STRUCTURED_JSON = "output/flow_v2/led_cases_lite.json"
+MAX_CHROMA_HITS = 6
+MAX_WRITES = 12
+MAX_CLEARS = 12
+MAX_TOP_ENTRY = 5
+MAX_PATHS_SHOW = 2
 
 # =========================
-# Ollama
+# Graph
 # =========================
+GRAPH = FirmwareQueryEngine(CALL_GRAPH_JSON)
+FUNC_SET = set(getattr(GRAPH, "func_names", []) or [])
 
-def ask_llm(prompt, temperature=0.2):
+# =========================
+# LLM System Prompt
+# =========================
+ZH_SYSTEM = """你是資深 Firmware/EC/BIOS 除錯工程師。
+
+【硬規則】
+- 一律使用「繁體中文」輸出。
+- function/變數/巨集/寄存器名稱保持原樣，不翻譯。
+- 嚴禁把 ON/OFF/TRUE/FALSE/ENABLE/DISABLE/Module_OFF 這類狀態詞當成 function 或證據。
+- 嚴禁在沒有 repo 證據時，提出「driver/OS/硬體故障」作為根因。除非 Evidence Digest 明確提到 OS driver/hardware/power rail。
+- 若證據不足：要明講「缺什麼證據」，並提出可操作的下一步（要哪段 log / 要哪個 reg dump / 要搜什麼 pattern）。
+
+【引用規則（Evidence-Gated）】
+- 我會提供 Evidence Digest，裡面每條都有編號 [E1] [E2]...
+- 你在根因/推論時，必須引用對應的 evidence 編號（至少 1 個）。
+- 不得引用不存在的編號；若沒有能支撐的 evidence，就必須說「目前沒有直接證據」。
+
+【工程工作方式】
+- 你可以提出假設，但必須對應到 Evidence 或清楚說明缺口與怎麼補證據。
+"""
+
+
+STOP_SYMBOLS = {
+    "ON", "OFF", "TRUE", "FALSE",
+    "ENABLE", "DISABLE",
+    "HIGH", "LOW",
+    "Module_ON", "Module_OFF",
+}
+
+
+# =========================
+# Utils
+# =========================
+def _english_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    letters = sum(1 for ch in text if ("a" <= ch.lower() <= "z"))
+    return letters / max(1, len(text))
+
+
+def ask_llm_raw(prompt: str, temperature: float = 0.2, timeout_s: int = 180) -> str:
+    full = ZH_SYSTEM + "\n\n" + prompt.strip() + "\n"
     r = requests.post(
         OLLAMA_URL,
         json={
             "model": MODEL,
-            "prompt": prompt,
+            "prompt": full,
             "stream": False,
-            "options": {"temperature": temperature}
+            "options": {"temperature": temperature},
         },
-        timeout=120,
+        timeout=timeout_s,
     )
     r.raise_for_status()
-    return r.json()["response"]
+    return (r.json().get("response") or "").strip()
 
-# =========================
-# Chroma
-# =========================
+
+def ask_llm(prompt: str, temperature: float = 0.2) -> str:
+    out = ask_llm_raw(prompt, temperature=temperature)
+    # 英文比例過高 → 二次改寫成繁中
+    if _english_ratio(out) > 0.10:
+        rewrite = f"""
+請把下列內容「完整改寫成繁體中文」，保留所有 function/變數/巨集/寄存器名稱原樣，不要加入新資訊，不要刪掉重點：
+
+--- 原文開始 ---
+{out}
+--- 原文結束 ---
+"""
+        out2 = ask_llm_raw(rewrite, temperature=0.1)
+        if out2:
+            return out2.strip()
+    return out
+
 
 def get_collection():
     client = chromadb.PersistentClient(path=CHROMA_PATH)
-    return client.get_collection(COLLECTION)
+    return client.get_collection(CHROMA_COLLECTION)
 
-def get_function_code(fn: str):
+
+# =========================
+# Chroma search
+# =========================
+def chroma_query(query: str, n: int = 5) -> List[Dict[str, Any]]:
+    q = (query or "").strip()
+    if not q:
+        return []
     col = get_collection()
-    res = col.get(where={"function": fn})
-    if res.get("documents"):
-        return res["documents"][0]
-    return None
+    res = col.query(query_texts=[q], n_results=n)
+    docs = (res.get("documents") or [[]])[0]
+    metas = (res.get("metadatas") or [[]])[0]
+    dists = (res.get("distances") or [[]])[0]
 
-def find_callers(target_fn: str):
-    """
-    Heuristic caller search:
-    - scan all documents in collection
-    - treat 'target_fn(' as callsite (ignore comments best-effort)
-    """
+    hits = []
+    for doc, meta, dist in zip(docs, metas, dists):
+        meta = meta or {}
+        hits.append({
+            "query": q,
+            "function": meta.get("function", "UNKNOWN_FN"),
+            "path": meta.get("path", meta.get("file", "UNKNOWN_PATH")),
+            "distance": float(dist) if dist is not None else 9999.0,
+            "excerpt": "\n".join((doc or "").splitlines()[:10]).strip() if isinstance(doc, str) else "",
+        })
+    hits.sort(key=lambda x: x["distance"])
+    return hits
+
+
+def chroma_query_many(queries: List[str], n_each: int = 4) -> List[Dict[str, Any]]:
+    all_hits = []
+    for q in queries:
+        all_hits.extend(chroma_query(q, n=n_each))
+
+    # dedup
+    seen = set()
+    dedup = []
+    for h in sorted(all_hits, key=lambda x: x["distance"]):
+        key = (h["function"], h["path"], (h.get("excerpt") or "")[:80])
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(h)
+    return dedup[:MAX_CHROMA_HITS]
+
+
+def chroma_get_all_docs() -> Dict[str, Any]:
     col = get_collection()
-    res = col.get()
-    callers = []
+    return col.get()
 
-    # match target_fn( with optional spaces, avoid matching in identifiers like foo_target_fn_bar
-    call_pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(target_fn)}\s*\(")
 
-    for meta, doc in zip(res.get("metadatas", []), res.get("documents", [])):
+# =========================
+# Intent Detection
+# =========================
+def detect_mode(q: str) -> str:
+    ql = (q or "").lower()
+
+    # function explain
+    if any(k in ql for k in ["在做甚麼", "做什麼", "用途", "解釋", "功能", "幹嘛", "做啥"]):
+        return "function"
+
+    # variable trace
+    if any(k in ql for k in ["哪裡改", "哪裡被改", "誰改", "誰寫", "哪裡設", "被改", "被設", "writer", "trace"]):
+        return "trace"
+
+    # debug + must use code evidence
+    if any(k in ql for k in ["從code", "從 code", "從程式碼", "code中", "code 中", "根據code", "用code分析", "repo中分析", "從repo分析"]):
+        return "debug_code"
+
+    return "debug"
+
+
+# =========================
+# Symbol Extraction
+# =========================
+def extract_symbols(question: str, max_syms: int = 10) -> Dict[str, List[str]]:
+    text = question or ""
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text)
+    tokens = [t for t in tokens if len(t) >= 3]
+
+    funcs = []
+    vars_macros = []
+    regs = []
+
+    for t in tokens:
+        if t in STOP_SYMBOLS:
+            continue
+
+        # function known by call graph
+        if t in FUNC_SET:
+            funcs.append(t)
+            continue
+
+        # register-ish
+        if t.isupper() and any(k in t for k in ("REG", "CTRL", "CFG", "STAT", "STS", "GPIO", "I2C", "SMB", "EC_RAM")):
+            regs.append(t)
+            continue
+
+        # vars/macros
+        if "_" in t or (not t.isupper() and any(c.isupper() for c in t[1:])):
+            vars_macros.append(t)
+            continue
+
+        if t.isupper():
+            vars_macros.append(t)
+
+    def uniq(xs):
+        out, seen = [], set()
+        for x in xs:
+            if x in seen:
+                continue
+            seen.add(x)
+            out.append(x)
+        return out
+
+    return {
+        "functions": uniq(funcs)[:8],
+        "vars_macros": uniq(vars_macros)[:max_syms],
+        "registers": uniq(regs)[:8],
+    }
+
+
+# =========================
+# Writer / Clear scan (regex)
+# =========================
+def scan_writer_clear(symbol: str, max_hits: int = 200) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    if not symbol or symbol in STOP_SYMBOLS:
+        return [], []
+
+    res = chroma_get_all_docs()
+    docs = res.get("documents", []) or []
+    metas = res.get("metadatas", []) or []
+
+    # 支援常見寫入 / bitwise / macro pattern（不完美，但比只抓 '=' 強很多）
+    pat_writer = re.compile(
+        rf"(?mi)^\s*.*\b{re.escape(symbol)}\b\s*(=|\+=|-=|\|=|&=|\^=|<<=|>>=)\s*.*$"
+    )
+    pat_macro_writer = re.compile(
+        rf"(?mi)^\s*.*(SET|CLR|CLEAR|RESET|WRITE|UPDATE)_[A-Z0-9_]*\s*\(\s*{re.escape(symbol)}\b.*$"
+    )
+    pat_clear = re.compile(
+        rf"(?mi)^\s*.*\b{re.escape(symbol)}\b.*(?:=\s*0\b|&=\s*~|\bCLEAR\b|\bRESET\b|\bDISABLE\b|\bCLR\b).*?$"
+    )
+
+    writers: List[Dict[str, str]] = []
+    clears: List[Dict[str, str]] = []
+
+    for meta, doc in zip(metas, docs):
         if not isinstance(doc, str):
             continue
-        if call_pat.search(doc):
-            callers.append(meta.get("function", "UNKNOWN_FN"))
+        fn = (meta or {}).get("function", "UNKNOWN_FN")
 
-    return sorted(set(callers))
+        for m in pat_writer.finditer(doc):
+            line = re.sub(r"\s+", " ", m.group(0)).strip()
+            writers.append({"function": fn, "excerpt": f"[{symbol}] {line}"})
+            if len(writers) >= max_hits:
+                break
+
+        for m in pat_macro_writer.finditer(doc):
+            line = re.sub(r"\s+", " ", m.group(0)).strip()
+            writers.append({"function": fn, "excerpt": f"[{symbol}] {line}"})
+            if len(writers) >= max_hits:
+                break
+
+        for m in pat_clear.finditer(doc):
+            line = re.sub(r"\s+", " ", m.group(0)).strip()
+            clears.append({"function": fn, "excerpt": f"[{symbol}] {line}"})
+            if len(clears) >= max_hits:
+                break
+
+        if len(writers) >= max_hits and len(clears) >= max_hits:
+            break
+
+    # dedup
+    def dedup(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        out, seen = [], set()
+        for it in items:
+            k = (it["function"], it["excerpt"])
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(it)
+        return out
+
+    return dedup(writers)[:MAX_WRITES], dedup(clears)[:MAX_CLEARS]
+
+
+def rank_entrypoints_from_writers(writers: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    writer_funcs = [w["function"] for w in writers if w.get("function") in FUNC_SET]
+    if not writer_funcs:
+        return []
+
+    counter = Counter()
+    entry_to_writers = defaultdict(set)
+    example_paths = defaultdict(list)
+
+    for wf in writer_funcs:
+        ups = GRAPH.paths_up(wf, max_depth=10, max_paths=200) or []
+        if not ups:
+            entry = wf
+            counter[entry] += 1
+            entry_to_writers[entry].add(wf)
+            if not example_paths[entry]:
+                example_paths[entry].append([wf])
+            continue
+
+        for p in ups:
+            if not p:
+                continue
+            entry = p[-1]
+            counter[entry] += 1
+            entry_to_writers[entry].add(wf)
+            if len(example_paths[entry]) < MAX_PATHS_SHOW:
+                example_paths[entry].append(p)
+
+    ranked = []
+    for entry, cnt in counter.most_common(MAX_TOP_ENTRY):
+        ranked.append({
+            "entry": entry,
+            "paths_count": cnt,
+            "writers": sorted(list(entry_to_writers[entry]))[:8],
+            "examples": example_paths[entry][:MAX_PATHS_SHOW],
+        })
+    return ranked
+
 
 # =========================
-# Helpers: function name parsing
+# Evidence Builder (Generic)
 # =========================
+def build_evidence(question: str) -> Dict[str, Any]:
+    syms = extract_symbols(question)
+    # queries: symbols + original question (fallback semantic)
+    queries = []
+    for s in (syms["vars_macros"] + syms["functions"] + syms["registers"])[:10]:
+        queries.append(s)
+        queries.append(f"{s} clear")
+        queries.append(f"{s} reset")
+    queries.append(question)
 
-STOPWORDS = {
-    "firmware", "cpu", "fan", "update", "code", "flow", "mask",
-    "在哪裡", "哪裡", "有", "設定", "set", "the", "a", "an", "to", "of",
-    "this", "that", "is", "are"
-}
+    hits = chroma_query_many(queries[:18], n_each=3)
 
-def extract_function_name(question: str):
-    """
-    Try to find a plausible C identifier that exists in Chroma.
-    Strategy:
-      1) collect all identifier-like tokens
-      2) prefer tokens that exist as a function in Chroma
-      3) fallback to last identifier token
-    """
-    toks = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", question)
-    toks = [t for t in toks if t.lower() not in STOPWORDS]
+    related_fns = []
+    for h in hits:
+        fn = h.get("function")
+        if fn and fn != "UNKNOWN_FN":
+            related_fns.append(fn)
+    related_fns = list(dict.fromkeys(related_fns))[:6]
 
-    if not toks:
-        return None
+    callgraph = []
+    for fn in related_fns[:4]:
+        ups = GRAPH.paths_up(fn, max_depth=4, max_paths=8) or []
+        downs = GRAPH.paths_down(fn, max_depth=4, max_paths=8) or []
+        callgraph.append({"fn": fn, "up": ups[:2], "down": downs[:2]})
 
-    col = get_collection()
-    # try direct hits
-    for t in toks:
-        res = col.get(where={"function": t})
-        if res.get("documents"):
-            return t
+    writers_all = []
+    clears_all = []
+    # 掃 vars/macros（最有機會是 flag / 狀態）
+    for sym in (syms["vars_macros"] or [])[:5]:
+        w, c = scan_writer_clear(sym)
+        writers_all.extend(w)
+        clears_all.extend(c)
 
-    # fallback: last token that looks like function-ish
-    return toks[-1]
+    top_entry = rank_entrypoints_from_writers(writers_all)
+
+    return {
+        "symbols": syms,
+        "hits": hits,
+        "related_fns": related_fns,
+        "callgraph": callgraph,
+        "writers": writers_all[:MAX_WRITES],
+        "clears": clears_all[:MAX_CLEARS],
+        "top_entry": top_entry[:MAX_TOP_ENTRY],
+    }
+
+
+def format_digest(ev: Dict[str, Any]) -> str:
+    sym = ev.get("symbols") or {}
+    hits = ev.get("hits") or []
+    writers = ev.get("writers") or []
+    clears = ev.get("clears") or []
+    top_entry = ev.get("top_entry") or []
+    callgraph = ev.get("callgraph") or []
+
+    eid = 1
+    lines = []
+
+    lines.append("【抽到的 symbols】")
+    lines.append(f"- functions: {', '.join(sym.get('functions', []) or []) or '(無)'}")
+    lines.append(f"- vars/macros: {', '.join(sym.get('vars_macros', []) or []) or '(無)'}")
+    lines.append(f"- registers: {', '.join(sym.get('registers', []) or []) or '(無)'}")
+    lines.append("")
+
+    lines.append("【Chroma 命中（Top）】")
+    if not hits:
+        lines.append(f"[E{eid}] (無命中)"); eid += 1
+    else:
+        for h in hits[:MAX_CHROMA_HITS]:
+            lines.append(f"[E{eid}] fn={h['function']} | dist={h['distance']:.4f} | file={h['path']}")
+            eid += 1
+            if h.get("excerpt"):
+                for ln in h["excerpt"].splitlines()[:3]:
+                    lines.append(f"    {ln}")
+    lines.append("")
+
+    lines.append("【Call Graph（上下游）】")
+    if not callgraph:
+        lines.append(f"[E{eid}] (無)"); eid += 1
+    else:
+        for cg in callgraph[:4]:
+            lines.append(f"[E{eid}] fn={cg['fn']}")
+            eid += 1
+            for p in cg.get("up", [])[:2]:
+                lines.append(f"    up: {' -> '.join(p)}")
+            for p in cg.get("down", [])[:2]:
+                lines.append(f"    down: {' -> '.join(p)}")
+    lines.append("")
+
+    lines.append("【writer（Top）】")
+    if not writers:
+        lines.append(f"[E{eid}] (沒有掃到賦值/位元操作寫入點)"); eid += 1
+    else:
+        for w in writers[:MAX_WRITES]:
+            lines.append(f"[E{eid}] {w['function']}: {w['excerpt']}")
+            eid += 1
+    lines.append("")
+
+    lines.append("【clear/reset（Top）】")
+    if not clears:
+        lines.append(f"[E{eid}] (沒有掃到明顯 clear/reset pattern)"); eid += 1
+    else:
+        for c in clears[:MAX_CLEARS]:
+            lines.append(f"[E{eid}] {c['function']}: {c['excerpt']}")
+            eid += 1
+    lines.append("")
+
+    lines.append("【writer -> paths_up Top Entrypoint】")
+    if not top_entry:
+        lines.append(f"[E{eid}] (writer function 不在 call graph 或找不到 paths_up)"); eid += 1
+    else:
+        for i, e in enumerate(top_entry[:MAX_TOP_ENTRY], 1):
+            lines.append(f"[E{eid}] {i}. 入口：{e['entry']} | writers={', '.join(e.get('writers', []) or []) or '(無)'} | paths_count={e.get('paths_count', 0)}")
+            eid += 1
+            for p in (e.get("examples") or [])[:MAX_PATHS_SHOW]:
+                lines.append(f"    - 例： {' -> '.join(p)}")
+
+    return "\n".join(lines)
+
 
 # =========================
-# Mode Detection
+# Mode Handlers
 # =========================
-
-def is_explain_question(q: str):
-    return bool(re.search(r"在做什麼|是幹嘛|what does|用途|功能|幹嘛用", q, re.IGNORECASE))
-
-def is_sink_trace_question(q: str):
-    return bool(re.search(r"誰.*call|誰.*呼叫|who calls|callers of|哪裡呼叫", q, re.IGNORECASE))
-
-def is_control_flow_question(q: str):
-    # explicitly ask about switch/case/graph/decision/branch
-    return bool(re.search(r"case|switch|分支|條件|decision|graph|flow v2|led_cases", q, re.IGNORECASE))
-
-def is_data_flow_question(q: str):
-    # mask/flag/bit/assign and similar
-    return bool(re.search(r"mask|flag|bit|bitmap|位元|遮罩|設定|set|清除|clear|IS_MASK|SET_MASK|CLR_MASK|assign|賦值|=", q, re.IGNORECASE))
-
-# =========================
-# Modes
-# =========================
-
-def explain_mode(question: str):
-    fn = extract_function_name(question)
+def function_mode(question: str) -> str:
+    # 抓第一個 symbol 當 function
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", question or "")
+    fn = tokens[0] if tokens else ""
     if not fn:
-        return "我抓不到你要看的 function 名稱（請直接打 function name，例如：cpu_fan_update 在做什麼）"
+        return "我沒有抓到 function 名稱。請用像「HotKey_Fn_F12 在做甚麼」這種問法。"
 
-    code = get_function_code(fn)
-    if not code:
-        return f"找不到 function: {fn}"
+    hits = chroma_query(fn, n=3)
+    code_excerpt = hits[0]["excerpt"] if hits else ""
+
+    callers = GRAPH.paths_up(fn, max_depth=4, max_paths=10) or []
+    callees = GRAPH.paths_down(fn, max_depth=4, max_paths=10) or []
 
     prompt = f"""
-You are a firmware code analyst.
+想了解的 function：{fn}
 
-Explain this C function:
+Code excerpt（可能不完整）：
+{code_excerpt or "(Chroma 未命中或 excerpt 為空)"}
 
-{code}
+Callers（paths_up）：
+{callers}
 
-Explain:
-1) Purpose (一句話)
-2) Main logic steps
-3) Key variables / flags
-4) Whether it directly affects hardware (PWM/register/GPIO/EC RAM)
-Return in Traditional Chinese.
+Callees（paths_down）：
+{callees}
+
+請輸出：
+1) 功能說明（它在做什麼）
+2) 主要邏輯流程（用條列）
+3) 呼叫關係（上游/下游）
+4) 可能的副作用（改哪些 flag/狀態/寄存器）
+如果 excerpt 不足，請明講「缺哪段 code」，並建議我該搜尋哪個關鍵字或要哪個檔案片段。
 """
-    return ask_llm(prompt)
+    return ask_llm(prompt, temperature=0.2)
 
-def sink_trace_mode(question: str):
-    fn = extract_function_name(question)
-    if not fn:
-        # fallback: last identifier
-        toks = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", question)
-        fn = toks[-1] if toks else None
 
-    if not fn:
-        return "我抓不到 target function 名稱（請直接打：誰 call cpu_fan_update）"
+def trace_mode(question: str) -> str:
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", question or "")
+    sym = tokens[0] if tokens else ""
+    if not sym:
+        return "我沒有抓到變數/巨集名稱。請用像「Hotkey_CAMERA 哪裡改」這種問法。"
 
-    callers = find_callers(fn)
-    if not callers:
-        return f"沒有找到 call {fn} 的 function（或 Chroma 裡還沒 index 到相關檔案）"
+    w, c = scan_writer_clear(sym)
+    top_entry = rank_entrypoints_from_writers(w)
 
-    return f"{fn} 被以下 function 呼叫:\n" + "\n".join(callers)
+    # 額外補：用 Chroma 找更多上下文
+    hits = chroma_query_many([sym, f"{sym} clear", f"{sym} reset"], n_each=4)
 
-def control_flow_mode(question: str):
-    if not Path(STRUCTURED_JSON).exists():
-        return "找不到 decision JSON（請確認 output/flow_v2/led_cases_lite.json 是否存在）"
+    digest = []
+    digest.append(f"變數/巨集：{sym}")
+    digest.append("\n【writers】")
+    digest += [f"- {x['function']}: {x['excerpt']}" for x in w] if w else ["- (無)"]
+    digest.append("\n【clears/resets】")
+    digest += [f"- {x['function']}: {x['excerpt']}" for x in c] if c else ["- (無)"]
+    digest.append("\n【Top Entrypoint（由 writers 反推）】")
+    if top_entry:
+        for e in top_entry:
+            digest.append(f"- {e['entry']} | writers={', '.join(e.get('writers', []))}")
+            for p in (e.get("examples") or [])[:MAX_PATHS_SHOW]:
+                digest.append(f"  例：{' -> '.join(p)}")
+    else:
+        digest.append("- (無)")
 
-    data = json.loads(Path(STRUCTURED_JSON).read_text(encoding="utf-8"))
+    digest.append("\n【Chroma 命中】")
+    if hits:
+        for h in hits[:MAX_CHROMA_HITS]:
+            digest.append(f"- fn={h['function']} | file={h['path']} | dist={h['distance']:.4f}")
+    else:
+        digest.append("- (無)")
 
     prompt = f"""
-You are a firmware control-flow analyzer.
+使用者想追：{sym}
 
-Use this structured graph:
+我掃到的證據：
+{chr(10).join(digest)}
 
-{json.dumps(data, indent=2)}
-
-Question:
-{question}
-
-Answer strictly based on the graph.
-Return in Traditional Chinese.
+請輸出：
+1) 最可能的「寫入點」是哪些（優先列出 writers，有 excerpt 就引用）
+2) 是否存在 override/定時器覆寫風險（若有 entrypoint 是 timer hook，要講明）
+3) 下一步怎麼驗證（在哪些 function 加 log、印哪些值、要抓哪段 log）
+限制：不要靠 function 名稱硬猜，請盡量引用上面掃到的 excerpt 作為證據。
 """
-    return ask_llm(prompt)
+    return ask_llm(prompt, temperature=0.2)
 
-def data_flow_mode(question: str):
-    """
-    For questions like:
-      - cpu_fan_update 哪裡設定 mask
-      - 這段 code 哪裡 set flag
-      - 哪裡 clear bit
-    We'll:
-      1) load the function code
-      2) ask LLM to pinpoint mask/flag operations (exact lines/expressions)
-      3) optionally list callers if question implies flow entry
-    """
-    fn = extract_function_name(question)
-    if not fn:
-        return "我抓不到你要看的 function 名稱（請直接打 function name，例如：cpu_fan_update 哪裡設定 mask）"
 
-    code = get_function_code(fn)
-    if not code:
-        return f"找不到 function: {fn}"
+def debug_code_mode(question: str) -> str:
+    ev = build_evidence(question)
+    digest = format_digest(ev)
 
-    callers_hint = ""
-    if re.search(r"flow|哪裡進來|從哪裡呼叫|誰呼叫", question, re.IGNORECASE):
-        callers = find_callers(fn)
-        if callers:
-            callers_hint = "Possible callers:\n" + "\n".join(callers)
-        else:
-            callers_hint = "Possible callers: (none found by heuristic search)"
+    has_real_evidence = bool(ev["hits"] or ev["writers"] or ev["clears"] or ev["callgraph"])
+    if not has_real_evidence:
+        return (
+            "目前資料庫內沒有足夠 repo 證據可以「從 code 分析」。\n"
+            "你可以補其中一項，我就能繼續：\n"
+            "1) 你的 log 片段（含關鍵字，例如 function 名 / reg 名 / 變數名）\n"
+            "2) 你懷疑的變數/bit/寄存器名稱（例如 EC_RAM82 / GPIOB2 / HotKeyStatus）\n"
+            "3) 你觀察到的觸發事件（timer? interrupt? HID write? WMI?）"
+        )
 
     prompt = f"""
-You are a firmware data-flow analyst.
+使用者問題：{question}
 
-Task:
-- Identify where masks/flags/bits are set/cleared/checked/updated in the given function.
-- Point to the exact expressions/macros, and explain what each does.
-- If the code uses macros like IS_MASK_SET/IS_MASK_CLEAR/SET_MASK/CLR_MASK, explain them based on usage.
-- If there is no mask operation in this function, say so clearly and suggest where to search next (e.g., callers or related setters).
+Evidence Digest（只能引用 [E#] 作為證據）：
+{digest}
 
-Function name: {fn}
+請輸出（必須繁中）：
+1) Top3 最可能根因（每個：為什麼 + 至少引用 1 個 [E#]）
+2) 下一步 Debug Plan（具體：在哪些 function 加 log、要印哪些變數/bit、或要抓哪段 log/reg dump）
+3) 2~3 個關鍵追問（用來縮小範圍）
 
-{callers_hint}
-
-C code:
-{code}
-
-Return in Traditional Chinese with bullet points.
+限制：
+- 嚴禁在沒有 Evidence 支撐下，講 driver/硬體故障/OS 問題。
+- 若 Evidence 沒辦法直接指向根因，請明講「目前沒有直接證據」，並提出如何補證據的具體步驟。
 """
-    return ask_llm(prompt)
+    return ask_llm(prompt, temperature=0.2)
+
+
+def debug_mode(question: str) -> str:
+    # 一般 debug：允許比較粗，但仍建議引用證據；此 mode 不強制 evidence gating
+    # 但我仍然會先嘗試 build_evidence，讓它不要亂講
+    ev = build_evidence(question)
+    digest = format_digest(ev)
+
+    prompt = f"""
+使用者問題：{question}
+
+（我有做 repo 搜尋，結果如下；如果你能引用 [E#] 請引用）
+Evidence Digest：
+{digest}
+
+請輸出：
+1) 你目前的初步判斷（可含假設，但要說明信心）
+2) 最值得先查的 3 個方向（要具體到 function/變數/檔案）
+3) 下一步要我提供什麼資料（log/reg/spec/觸發條件）
+"""
+    return ask_llm(prompt, temperature=0.2)
+
 
 # =========================
-# Router
+# Memory (light)
 # =========================
+DEFAULT_MEM = {"history": [], "last_mode": None, "last_symbols": {}}
 
-def route(q: str):
-    # Priority matters:
-    # data-flow questions should NOT fall into control-flow graph by default.
-    if is_sink_trace_question(q):
-        return sink_trace_mode(q)
+def load_mem(path: Optional[str]) -> Dict[str, Any]:
+    mem = json.loads(json.dumps(DEFAULT_MEM))
+    if not path:
+        return mem
+    p = Path(path)
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                mem.update(data)
+        except Exception:
+            pass
+    return mem
 
-    if is_data_flow_question(q):
-        return data_flow_mode(q)
+def save_mem(path: Optional[str], mem: Dict[str, Any]) -> None:
+    if not path:
+        return
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(mem, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    if is_explain_question(q):
-        return explain_mode(q)
-
-    if is_control_flow_question(q):
-        return control_flow_mode(q)
-
-    # default: explain mode is usually safer than decision graph
-    # because most questions are about real code, not the LED case graph.
-    return explain_mode(q)
 
 # =========================
-# Main
+# CLI
 # =========================
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", "--interactive", action="store_true")
-    parser.add_argument("-q", "--question")
+    parser.add_argument("-q", "--question", default=None)
+    parser.add_argument("--memory-file", default=None)
     args = parser.parse_args()
+
+    mem = load_mem(args.memory_file)
+
+    def handle(q: str) -> str:
+        mode = detect_mode(q)
+        mem["last_mode"] = mode
+        mem["history"].append({"q": q[:400], "mode": mode})
+        if len(mem["history"]) > 40:
+            mem["history"] = mem["history"][-40:]
+
+        if mode == "function":
+            return function_mode(q)
+        if mode == "trace":
+            return trace_mode(q)
+        if mode == "debug_code":
+            return debug_code_mode(q)
+        return debug_mode(q)
 
     if args.interactive:
         while True:
             q = input("firmware> ").strip()
-            if q.lower() in ["exit", "quit"]:
+            if not q:
+                continue
+            if q.lower() in ("exit", "quit"):
                 break
-            print(route(q))
+            if q.lower() == "state":
+                print(json.dumps({
+                    "model": MODEL,
+                    "ollama_url": OLLAMA_URL,
+                    "chroma_path": CHROMA_PATH,
+                    "collection": CHROMA_COLLECTION,
+                    "call_graph": CALL_GRAPH_JSON,
+                    "last_mode": mem.get("last_mode"),
+                }, ensure_ascii=False, indent=2))
+                continue
+            if q.lower() == "reset":
+                mem = json.loads(json.dumps(DEFAULT_MEM))
+                print("已 reset（清空 memory）")
+                save_mem(args.memory_file, mem)
+                continue
+
+            try:
+                out = handle(q)
+                print(out)
+            except Exception as e:
+                print(f"ERROR: {e}")
+
+            save_mem(args.memory_file, mem)
+
     else:
         if not args.question:
-            print("請提供問題")
+            print("請用 -q 提供問題，或用 -i 互動模式")
             return
-        print(route(args.question))
+        out = handle(args.question)
+        print(out)
+        save_mem(args.memory_file, mem)
+
 
 if __name__ == "__main__":
     main()
